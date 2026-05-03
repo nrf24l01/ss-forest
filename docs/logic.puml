@@ -1,0 +1,32 @@
+@startuml logic
+
+title Device Logic
+
+start
+:Device connected to ESP-MESH;
+:Works as repeater and transmitter;
+
+repeat
+	:LED - off (battery saving);
+	:Wait for button press;
+	if (Button pressed?) then (yes)
+		:LED - blue fast blink;
+		:Enable Bluetooth;
+		:Find nearest device;
+		if (Distance <= 1 m?) then (yes)
+			:LED - yellow solid;
+			:Connect to device;
+			:LED - green solid;
+			:LED - green fast blink;
+			:Send its data to server;
+			:LED - green solid;
+		else (no)
+			:LED - blue slow blink;
+			:Continue searching for nearest device;
+		endif
+	endif
+repeat while (Wait for next button press?) is (yes)
+
+stop
+
+@enduml

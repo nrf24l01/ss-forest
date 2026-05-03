@@ -1,0 +1,29 @@
+# ESP-IDF build artifacts
+**/build/
+**/sdkconfig
+**/sdkconfig.old
+
+# ESP-IDF managed components
+**/managed_components/
+
+# Tool outputs and logs
+**/*.elf
+**/*.bin
+**/*.map
+**/*.log
+**/compile_commands.json
+**/.ninja_log
+**/CMakeCache.txt
+**/CMakeFiles/
+
+# Python
+.venv/
+__pycache__/
+**/*.pyc
+**/*.pyo
+*.egg-info/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/

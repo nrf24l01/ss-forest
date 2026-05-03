@@ -1,0 +1,23 @@
+[project]
+name = "ss-forest-tools"
+version = "0.1.0"
+description = "PC test tools for SS Forest ESP32-C3 mesh nodes"
+requires-python = ">=3.10"
+dependencies = [
+    "bleak>=0.22.0",
+    "pyserial>=3.5",
+]
+
+[project.scripts]
+ss-ble-uuid-test = "tools.ble_uuid_test:main"
+ss-root-color-test = "tools.root_color_test:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tools"]

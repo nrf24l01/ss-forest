@@ -1,0 +1,45 @@
+menu "SS Forest Node Configuration"
+
+    config SS_BUTTON_GPIO
+        int "Button GPIO"
+        default 4
+
+    config SS_LED_GPIO
+        int "WS2812B GPIO"
+        default 20
+
+    config SS_LED_COUNT
+        int "WS2812B LED count"
+        range 1 32
+        default 2
+
+    config SS_BLE_SCAN_SECONDS
+        int "BLE scan duration seconds"
+        range 1 30
+        default 5
+
+    config SS_BLE_MAX_DISTANCE_CM
+        int "Accepted BLE distance cm"
+        range 10 1000
+        default 100
+
+    config SS_BLE_RSSI_AT_ONE_METER
+        int "RSSI at 1 meter calibration"
+        range -100 -20
+        default -59
+
+    config SS_BLE_PATH_LOSS_EXPONENT_X10
+        int "BLE path loss exponent x10"
+        range 10 60
+        default 20
+
+    config SS_ROOT_RESPONSE_TIMEOUT_MS
+        int "Root response timeout ms"
+        range 1000 60000
+        default 20000
+
+    config SS_BLE_GATT_DEVICE_NAME
+        string "BLE GATT device name"
+        default "SS-FOREST-NODE"
+
+endmenu

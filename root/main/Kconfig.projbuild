@@ -1,0 +1,7 @@
+menu "SS Forest Root Configuration"
+
+    config SS_ROOT_DEFAULT_RESPONSE
+        string "Default root response"
+        default "OK"
+
+endmenu

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "my-local-tool": {
+      "type": "local",
+      "command": ["uv", "run", "--directory", "/home/Technik12345/esp-mcp", "main.py"],
+      "enabled": true,
+      "environment": {
+        "IDF_PATH": "/opt/esp-idf"
+      }
+    }
+  }
+}
