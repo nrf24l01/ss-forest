@@ -1,5 +1,7 @@
 # SS Forest
+*Summer school forest project*
 
+---
 ESP-IDF project for an ESP32-C3 tree-shaped ESP-MESH network.
 
 The repository has two firmware applications:
