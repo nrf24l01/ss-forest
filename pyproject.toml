@@ -11,6 +11,10 @@ dependencies = [
 [project.scripts]
 ss-ble-uuid-test = "tools.ble_uuid_test:main"
 ss-root-color-test = "tools.root_color_test:main"
+ss-mesh-tool = "tools.mesh_tool:main"
+ss-mesh-api = "tools.mesh_tool:main"
+ss-mesh-client = "tools.mesh_api_client:main"
+ss-firmware = "tools.firmware:main"
 
 [tool.uv]
 package = true

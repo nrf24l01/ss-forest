@@ -2,7 +2,9 @@
 *Summer school forest project*
 
 ---
-ESP-IDF project for an ESP32-C3 tree-shaped ESP-MESH network.
+ESP-IDF project for a tree-shaped low-power wireless network.
+
+The root target is ESP32-H2 and the node target is ESP32-C3. The current firmware transport is ESP-MESH over Wi-Fi, so the root must remain on a Wi-Fi-capable target. ESP32-H2 has BLE and IEEE 802.15.4, but no Wi-Fi; migrating the root transport to Thread/OpenThread (or another 802.15.4 transport) is required before the root can run on H2.
 
 The repository has two firmware applications:
 
@@ -13,7 +15,7 @@ Shared mesh code is in `components/ss_mesh/`.
 
 ## Hardware
 
-- Target: ESP32-C3 on every device.
+- Target: ESP32-H2 for the root and ESP32-C3 for nodes.
 - Button: GPIO2, input pull-up. Connect button between GPIO2 and GND.
 - WS2812B DIN: GPIO7.
 - WS2812B power: use a suitable 5 V/3.3 V setup for your LED strip and common GND with ESP32-C3.
@@ -77,6 +79,7 @@ Use `idf.py monitor` or any serial terminal. Commands end with Enter.
 ```text
 help
 routes
+tree
 reply <text>
 color <#RRGGBB>
 sendcolor <node_mac> <#RRGGBB>
@@ -87,6 +90,7 @@ Commands:
 
 - `help` - print available commands.
 - `routes` - print current ESP-MESH routing table.
+- `tree` - print a snapshot of the mesh tree. Direct-child relationships are marked as known; routed descendants use the root as a safe fallback parent.
 - `reply <text>` - send a response to the last node that produced `NODE_REPORT`.
 - `color <#RRGGBB>` - send RGB color to the last node that produced `UUID_REQUEST` or `NODE_REPORT`.
 - `send <node_mac> <text>` - send a response to a specific node MAC. This uses session id `0`, which nodes accept as an out-of-band response.
@@ -99,7 +103,7 @@ The root also sends `CONFIG_SS_ROOT_DEFAULT_RESPONSE` automatically for every `N
 Run menuconfig separately for root and node:
 
 ```bash
-idf.py -C root set-target esp32c3
+idf.py -C root set-target esp32h2
 idf.py -C root menuconfig
 idf.py -C node set-target esp32c3
 idf.py -C node menuconfig
@@ -120,6 +124,7 @@ Node-only options under `SS Forest Node Configuration`:
 - `CONFIG_SS_LED_GPIO` - default `7`.
 - `CONFIG_SS_LED_COUNT` - default `2`.
 - `CONFIG_SS_BLE_SCAN_SECONDS` - BLE scan duration per button press.
+- `CONFIG_SS_BLE_CONNECT_WINDOW_SECONDS` - BLE discoverable/connectable window after button press.
 - `CONFIG_SS_BLE_MAX_DISTANCE_CM` - default `100` cm.
 - `CONFIG_SS_BLE_RSSI_AT_ONE_METER` - RSSI calibration value at 1 m, default `-59`.
 - `CONFIG_SS_BLE_PATH_LOSS_EXPONENT_X10` - path loss exponent multiplied by 10, default `20`.
@@ -131,10 +136,25 @@ Root-only options under `SS Forest Root Configuration`:
 
 ## Build And Flash
 
+For repeatable builds and parallel flashing, use `tools/firmware.py`. Each
+`--node-path` is paired with the corresponding `--node-port`:
+
+```bash
+python tools/firmware.py \
+  --root-path root --root-port /dev/ttyUSB0 \
+  --node-path node --node-port /dev/ttyUSB1 \
+  --node-path node --node-port /dev/ttyUSB2 \
+  --jobs 4
+```
+
+Use `--build-only` to build without flashing, or `--no-build` to flash
+already-built images. Set `IDF_PY` or pass `--idf` when `idf.py` is not on
+`PATH`.
+
 Root:
 
 ```bash
-idf.py -C root set-target esp32c3
+idf.py -C root set-target esp32h2
 idf.py -C root build
 idf.py -C root -p /dev/ttyUSB0 flash monitor
 ```
@@ -169,6 +189,45 @@ You can also use a JSON table:
 uv run ss-root-color-test --port /dev/ttyUSB0 --table-file tools/uuid_colors.example.json --color 00ff00 --print-all
 ```
 
+The mesh API server handles both operations at the same time. It continuously watches root serial output, answers UUID color requests, periodically refreshes the tree into a buffer, and persists color changes to a JSON file:
+
+```bash
+uv run ss-mesh-api server \
+  --port /dev/ttyUSB0 \
+  --table-file tools/uuid_colors.json \
+  --api-port 8080
+```
+
+Clients can configure colors without touching the serial port:
+
+```bash
+uv run ss-mesh-client color 550e8400-e29b-41d4-a716-446655440000 ff0000
+uv run ss-mesh-client colors '{"550e8400-e29b-41d4-a716-446655440000":"ff0000","other-uuid":"00ff00"}'
+uv run ss-mesh-client tree
+```
+
+API endpoints are `GET /api/tree`, `GET /api/colors`, `PUT /api/colors/{uuid}` with `{"color":"RRGGBB"}`, and `PATCH /api/colors` with a UUID-to-color JSON object.
+
+## Go Mesh API Tool
+
+The same watcher and API are also implemented in Go under `tools/go/`:
+
+```bash
+cd tools/go
+go run . server --port /dev/ttyUSB0 --table-file ../../tools/uuid_colors.json
+```
+
+Use the Go client in another terminal:
+
+```bash
+cd tools/go
+go run . client color 550e8400-e29b-41d4-a716-446655440000 ff0000
+go run . client colors '{"uuid-one":"ff0000","uuid-two":"00ff00"}'
+go run . client tree
+```
+
+The Go server owns the serial port, responds to UUID requests, continuously buffers the latest tree, and exposes the same HTTP API as the Python implementation.
+
 Send a UUID from PC to a node over BLE GATT:
 
 ```bash
@@ -188,7 +247,7 @@ The BLE service UUID is `01008f7a-8e13-6e9b-8348-6df4029a6c70` and the writable 
 
 ## Notes
 
-- All devices are ESP32-C3.
+- The root is currently configured for ESP32-H2, while nodes remain ESP32-C3 because ESP-MESH requires Wi-Fi.
 - The root firmware fixes itself as ESP-MESH root using `esp_mesh_fix_root(true)` and `esp_mesh_set_type(MESH_ROOT)`.
 - Child nodes are not fixed root and can form the tree below root.
 - BLE scanning and Wi-Fi mesh share the 2.4 GHz radio. Very long BLE scans can reduce mesh responsiveness.
