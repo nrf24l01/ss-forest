@@ -46,6 +46,11 @@ typedef enum {
     LED_RED_SOLID,
 } led_state_t;
 
+typedef enum {
+    BLE_WINDOW_OPEN = 1,
+    BLE_WINDOW_CLOSE = 2,
+} ble_window_event_t;
+
 typedef struct {
     ble_addr_t addr;
     int8_t rssi;
@@ -63,6 +68,7 @@ typedef struct {
     QueueHandle_t button_queue;
     QueueHandle_t uuid_queue;
     QueueHandle_t response_queue;
+    QueueHandle_t ble_window_queue;
     SemaphoreHandle_t scan_lock;
     led_strip_handle_t led_strip;
     led_state_t led_state;
@@ -75,8 +81,26 @@ typedef struct {
 
 static node_ctx_t s_ctx;
 static uint8_t s_own_addr_type;
+static volatile bool s_ble_window_active;
+static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
 static void start_ble_advertising(void);
+
+static void stop_ble_access(void)
+{
+    s_ble_window_active = false;
+    ble_gap_adv_stop();
+    if (s_ble_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_ble_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+}
+
+static void close_ble_window(void)
+{
+    uint8_t event = BLE_WINDOW_CLOSE;
+    xQueueSend(s_ctx.ble_window_queue, &event, 0);
+}
 
 static uint16_t estimate_distance_cm(int8_t rssi)
 {
@@ -114,6 +138,8 @@ static void led_set_color_from_payload(const uint8_t *payload, uint8_t payload_l
         s_ctx.color_rgb[0] = 0;
         s_ctx.color_rgb[1] = 0;
         s_ctx.color_rgb[2] = 0;
+        s_ctx.led_state = LED_KEEP_COLOR;
+        close_ble_window();
         return;
     }
     if (payload_len != 3) {
@@ -123,22 +149,27 @@ static void led_set_color_from_payload(const uint8_t *payload, uint8_t payload_l
     s_ctx.color_rgb[0] = payload[0];
     s_ctx.color_rgb[1] = payload[1];
     s_ctx.color_rgb[2] = payload[2];
+    s_ctx.led_state = LED_KEEP_COLOR;
+    close_ble_window();
 }
 
 static void led_task(void *arg)
 {
     bool mesh_on = false;
     bool ble_on = false;
-    led_state_t last_state = -1;
+    led_state_t last_mesh_state = -1;
+    led_state_t last_led_state = -1;
     uint8_t last_color[3] = { 0xff, 0xff, 0xff };
     uint8_t last_status[3] = { 0xff, 0xff, 0xff };
 
     while (true) {
         led_state_t mesh_state = s_ctx.mesh_connected ? LED_GREEN_SOLID :
-                                 (s_ctx.mesh_connected_once ? LED_RED_SOLID : LED_MESH_INIT);
-        bool use_ble_color = !(s_ctx.led_state == LED_OFF ||
-                               s_ctx.led_state == LED_KEEP_COLOR ||
-                               s_ctx.led_state == LED_MESH_INIT);
+                                  (s_ctx.mesh_connected_once ? LED_RED_SOLID : LED_MESH_INIT);
+        led_state_t led_state = s_ctx.led_state;
+        bool ble_activity = s_ble_window_active ||
+                            (led_state != LED_OFF && led_state != LED_KEEP_COLOR &&
+                             led_state != LED_MESH_INIT);
+        bool use_ble_color = ble_activity;
 
         uint8_t color_red = s_ctx.color_rgb[0];
         uint8_t color_green = s_ctx.color_rgb[1];
@@ -150,12 +181,6 @@ static void led_task(void *arg)
         uint32_t ble_delay_ms = 250;
 
         switch (mesh_state) {
-        case LED_OFF:
-            mesh_delay_ms = 250;
-            break;
-        case LED_KEEP_COLOR:
-            mesh_delay_ms = 250;
-            break;
         case LED_MESH_INIT:
             mesh_on = !mesh_on;
             status_red = mesh_on ? 24 : 0;
@@ -187,10 +212,18 @@ static void led_task(void *arg)
             status_red = 32;
             mesh_delay_ms = 250;
             break;
+        default:
+            break;
         }
 
-        if (use_ble_color) {
-            switch (s_ctx.led_state) {
+        if (s_ble_window_active) {
+            ble_on = !ble_on;
+            color_red = 0;
+            color_green = 0;
+            color_blue = ble_on ? 32 : 0;
+            ble_delay_ms = 120;
+        } else if (use_ble_color) {
+            switch (led_state) {
             case LED_BLUE_FAST:
                 ble_on = !ble_on;
                 color_blue = ble_on ? 32 : 0;
@@ -226,7 +259,7 @@ static void led_task(void *arg)
 
         uint32_t delay_ms = use_ble_color ? ble_delay_ms : mesh_delay_ms;
 
-        if (last_state != mesh_state ||
+        if (last_mesh_state != mesh_state || last_led_state != led_state ||
             last_color[0] != color_red || last_color[1] != color_green || last_color[2] != color_blue ||
             last_status[0] != status_red || last_status[1] != status_green || last_status[2] != status_blue) {
             led_set_pixels(color_red, color_green, color_blue, status_red, status_green, status_blue);
@@ -238,7 +271,8 @@ static void led_task(void *arg)
             last_status[2] = status_blue;
         }
 
-        last_state = mesh_state;
+        last_mesh_state = mesh_state;
+        last_led_state = led_state;
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
@@ -314,15 +348,22 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         xSemaphoreGive(s_ctx.scan_lock);
         return 0;
     } else if (event->type == BLE_GAP_EVENT_CONNECT) {
-        if (event->connect.status != 0) {
+        if (event->connect.status == 0) {
+            s_ble_conn_handle = event->connect.conn_handle;
+        } else if (s_ble_window_active) {
             start_ble_advertising();
         }
         return 0;
     } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
-        start_ble_advertising();
+        s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        if (s_ble_window_active) {
+            start_ble_advertising();
+        }
         return 0;
     } else if (event->type == BLE_GAP_EVENT_ADV_COMPLETE) {
-        start_ble_advertising();
+        if (s_ble_window_active) {
+            start_ble_advertising();
+        }
         return 0;
     }
 
@@ -375,6 +416,10 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
 
 static void start_ble_advertising(void)
 {
+    if (!s_ble_window_active) {
+        return;
+    }
+
     struct ble_hs_adv_fields fields = { 0 };
     const char *name = ble_svc_gap_device_name();
 
@@ -405,7 +450,6 @@ static void ble_on_sync(void)
         ESP_LOGE(TAG, "BLE address init failed: %d", rc);
         return;
     }
-    start_ble_advertising();
 }
 
 static void ble_host_task(void *param)
@@ -427,6 +471,44 @@ static esp_err_t ble_init(void)
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init(ble_host_task);
     return ESP_OK;
+}
+
+static void ble_window_task(void *arg)
+{
+    uint8_t event;
+
+    while (xQueueReceive(s_ctx.ble_window_queue, &event, portMAX_DELAY) == pdTRUE) {
+        if (event == BLE_WINDOW_CLOSE) {
+            stop_ble_access();
+            continue;
+        }
+
+        s_ble_window_active = true;
+        start_ble_advertising();
+
+        TickType_t deadline = xTaskGetTickCount() +
+                              pdMS_TO_TICKS(CONFIG_SS_BLE_CONNECT_WINDOW_SECONDS * 1000);
+        while (s_ble_window_active) {
+            TickType_t now = xTaskGetTickCount();
+            TickType_t remaining = deadline - now;
+            if ((int32_t)remaining <= 0) {
+                stop_ble_access();
+                ESP_LOGI(TAG, "BLE connectability window closed");
+                break;
+            }
+
+            if (xQueueReceive(s_ctx.ble_window_queue, &event, remaining) == pdTRUE) {
+                if (event == BLE_WINDOW_CLOSE) {
+                    stop_ble_access();
+                    ESP_LOGI(TAG, "BLE connectability window closed after UUID");
+                    break;
+                }
+                deadline = xTaskGetTickCount() +
+                           pdMS_TO_TICKS(CONFIG_SS_BLE_CONNECT_WINDOW_SECONDS * 1000);
+                start_ble_advertising();
+            }
+        }
+    }
 }
 
 static esp_err_t scan_nearest_device(ble_target_t *target)
@@ -468,13 +550,25 @@ static void mesh_recv_cb(mesh_addr_t *from, mesh_data_t *data)
     ss_mesh_packet_t packet;
     memcpy(&packet, data->data, sizeof(packet));
     if (packet.magic != SS_PROTOCOL_MAGIC || packet.version != SS_PROTOCOL_VERSION ||
-        (packet.type != SS_PACKET_ROOT_RESPONSE && packet.type != SS_PACKET_COLOR_RESPONSE) ||
-        (packet.session_id != s_ctx.current_session_id && packet.session_id != 0)) {
+        memcmp(packet.node_mac, ss_mesh_get_station_mac(), sizeof(packet.node_mac)) != 0 ||
+        (packet.type != SS_PACKET_ROOT_RESPONSE && packet.type != SS_PACKET_COLOR_RESPONSE)) {
         return;
     }
 
-    if (packet.type == SS_PACKET_COLOR_RESPONSE && packet.session_id == 0) {
+    // Color commands are addressed by node MAC. Do not correlate them with the
+    // shared transaction ID because button and UUID sessions may overlap.
+    if (packet.type == SS_PACKET_COLOR_RESPONSE) {
+        if (packet.payload_len != 0 && packet.payload_len != 3) {
+            ESP_LOGW(TAG, "invalid color response length: %u", packet.payload_len);
+            return;
+        }
+        ESP_LOGI(TAG, "color response accepted for " MACSTR " color=%02x%02x%02x",
+                 MAC2STR(packet.node_mac), packet.payload[0], packet.payload[1], packet.payload[2]);
         led_set_color_from_payload(packet.payload, packet.payload_len);
+        return;
+    }
+
+    if (packet.session_id != s_ctx.current_session_id && packet.session_id != 0) {
         return;
     }
 
@@ -547,6 +641,7 @@ static void session_task(void *arg)
 
     while (true) {
         xQueueReceive(s_ctx.button_queue, &event, portMAX_DELAY);
+        xQueueSend(s_ctx.ble_window_queue, &event, 0);
         if (!ss_mesh_is_connected()) {
             ESP_LOGW(TAG, "button pressed but mesh is not connected yet");
             s_ctx.led_state = LED_RED_SOLID;
@@ -605,14 +700,20 @@ static void session_task(void *arg)
         ss_mesh_packet_t response;
         if (xQueueReceive(s_ctx.response_queue, &response, pdMS_TO_TICKS(CONFIG_SS_ROOT_RESPONSE_TIMEOUT_MS))) {
             ESP_LOGI(TAG, "root response: %.*s", response.payload_len, response.payload);
-            s_ctx.led_state = LED_GREEN_SOLID;
+            if (response.type == SS_PACKET_COLOR_RESPONSE) {
+                led_set_color_from_payload(response.payload, response.payload_len);
+            } else {
+                s_ctx.led_state = LED_GREEN_SOLID;
+            }
         } else {
             ESP_LOGW(TAG, "root response timeout");
             s_ctx.led_state = LED_RED_SOLID;
         }
 
         vTaskDelay(pdMS_TO_TICKS(1500));
-        s_ctx.led_state = LED_OFF;
+        if (s_ctx.led_state != LED_KEEP_COLOR) {
+            s_ctx.led_state = LED_OFF;
+        }
     }
 }
 
@@ -622,10 +723,12 @@ void app_main(void)
     s_ctx.button_queue = xQueueCreate(4, sizeof(uint8_t));
     s_ctx.uuid_queue = xQueueCreate(4, sizeof(uuid_request_t));
     s_ctx.response_queue = xQueueCreate(2, sizeof(ss_mesh_packet_t));
+    s_ctx.ble_window_queue = xQueueCreate(2, sizeof(uint8_t));
     s_ctx.scan_lock = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(s_ctx.button_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(s_ctx.uuid_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(s_ctx.response_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    ESP_ERROR_CHECK(s_ctx.ble_window_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(s_ctx.scan_lock == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     ESP_ERROR_CHECK(led_init());
@@ -640,6 +743,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(ss_mesh_init(mesh_recv_cb, false));
     ESP_ERROR_CHECK(ble_init());
+    xTaskCreate(ble_window_task, "ble_window", 3072, NULL, 5, NULL);
     s_ctx.led_state = LED_GREEN_SOLID;
     vTaskDelay(pdMS_TO_TICKS(700));
     s_ctx.led_state = LED_OFF;

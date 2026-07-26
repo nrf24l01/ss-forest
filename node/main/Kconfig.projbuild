@@ -18,6 +18,11 @@ menu "SS Forest Node Configuration"
         range 1 30
         default 5
 
+    config SS_BLE_CONNECT_WINDOW_SECONDS
+        int "BLE connectability window seconds"
+        range 1 300
+        default 30
+
     config SS_BLE_MAX_DISTANCE_CM
         int "Accepted BLE distance cm"
         range 10 1000

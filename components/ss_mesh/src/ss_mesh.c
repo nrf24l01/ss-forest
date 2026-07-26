@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -12,6 +13,7 @@
 
 #include "mesh_netif.h"
 #include "ss_mesh.h"
+#include "ss_mesh_tree.h"
 
 static const char *TAG = "ss_mesh";
 static const uint8_t SS_MESH_ID[6] = { 0x53, 0x53, 0x46, 0x4f, 0x52, 0x01 };
@@ -62,11 +64,13 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
     case MESH_EVENT_CHILD_CONNECTED: {
         mesh_event_child_connected_t *child = (mesh_event_child_connected_t *)event_data;
+        ss_mesh_tree_child_connected(child->mac);
         ESP_LOGI(TAG, "child connected aid=%d mac=" MACSTR, child->aid, MAC2STR(child->mac));
         break;
     }
     case MESH_EVENT_CHILD_DISCONNECTED: {
         mesh_event_child_disconnected_t *child = (mesh_event_child_disconnected_t *)event_data;
+        ss_mesh_tree_child_disconnected(child->mac);
         ESP_LOGI(TAG, "child disconnected aid=%d mac=" MACSTR, child->aid, MAC2STR(child->mac));
         break;
     }
@@ -100,6 +104,7 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
 
 esp_err_t ss_mesh_init(ss_mesh_recv_cb_t *recv_cb, bool fixed_root)
 {
+    ESP_RETURN_ON_ERROR(ss_mesh_tree_init(), TAG, "init mesh tree");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase nvs");
@@ -164,8 +169,6 @@ esp_err_t ss_mesh_send_to_root(const void *payload, size_t len)
 
 esp_err_t ss_mesh_send_to_node(const uint8_t node_mac[6], const void *payload, size_t len)
 {
-    mesh_addr_t route_table[CONFIG_MESH_ROUTE_TABLE_SIZE];
-    int route_table_size = 0;
     mesh_data_t data = {
         .data = (uint8_t *)payload,
         .size = len,
@@ -173,12 +176,40 @@ esp_err_t ss_mesh_send_to_node(const uint8_t node_mac[6], const void *payload, s
         .tos = MESH_TOS_P2P,
     };
 
-    ESP_RETURN_ON_ERROR(esp_mesh_get_routing_table(route_table, sizeof(route_table), &route_table_size), TAG,
-                        "get routing table");
-    for (int i = 0; i < route_table_size; i++) {
-        if (memcmp(route_table[i].addr, node_mac, 6) == 0) {
-            return esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int route_table_capacity = esp_mesh_get_routing_table_size();
+        int route_table_size = 0;
+        if (route_table_capacity <= 0) {
+            return ESP_ERR_NOT_FOUND;
         }
+
+        mesh_addr_t *route_table = calloc((size_t)route_table_capacity, sizeof(*route_table));
+        if (route_table == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+
+        esp_err_t err = esp_mesh_get_routing_table(route_table, route_table_capacity * sizeof(*route_table),
+                                                   &route_table_size);
+        if (err != ESP_OK) {
+            free(route_table);
+            return err;
+        }
+
+        if (route_table_size > route_table_capacity) {
+            free(route_table);
+            continue;
+        }
+
+        for (int i = 0; i < route_table_size; i++) {
+            if (memcmp(route_table[i].addr, node_mac, 6) == 0) {
+                err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
+                free(route_table);
+                return err;
+            }
+        }
+
+        free(route_table);
+        return ESP_ERR_NOT_FOUND;
     }
 
     return ESP_ERR_NOT_FOUND;

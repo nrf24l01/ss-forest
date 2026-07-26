@@ -1,5 +1,6 @@
 #include "mesh_netif.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -17,14 +18,21 @@ static uint8_t s_station_mac[6];
 
 static void receive_task(void *arg)
 {
-    uint8_t rx_buffer[MESH_RX_BUFFER_SIZE];
+    uint8_t *rx_buffer = malloc(MESH_RX_BUFFER_SIZE);
     mesh_addr_t from;
     mesh_data_t data;
     int flag;
 
+    if (rx_buffer == NULL) {
+        ESP_LOGE(TAG, "failed to allocate mesh RX buffer");
+        s_receive_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
     while (s_receive_task != NULL) {
         data.data = rx_buffer;
-        data.size = sizeof(rx_buffer);
+        data.size = MESH_RX_BUFFER_SIZE;
         flag = 0;
         esp_err_t err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
         if (err != ESP_OK) {
@@ -38,6 +46,7 @@ static void receive_task(void *arg)
         }
     }
 
+    free(rx_buffer);
     s_receive_task = NULL;
     vTaskDelete(NULL);
 }

@@ -12,6 +12,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "ss_mesh.h"
+#include "ss_mesh_tree.h"
 #include "ss_protocol.h"
 
 static const char *TAG = "ss_root";
@@ -21,7 +22,13 @@ typedef struct {
     uint32_t session_id;
 } pending_response_t;
 
+typedef struct {
+    mesh_addr_t from;
+    ss_mesh_packet_t packet;
+} mesh_rx_item_t;
+
 static QueueHandle_t s_pending_queue;
+static QueueHandle_t s_mesh_rx_queue;
 
 static void print_hex(const uint8_t *data, uint8_t len)
 {
@@ -71,6 +78,59 @@ static void send_color_response(const uint8_t node_mac[6], uint32_t session_id, 
     }
 }
 
+static void process_mesh_packet(const ss_mesh_packet_t *packet, const mesh_addr_t *from)
+{
+    if (packet->magic != SS_PROTOCOL_MAGIC || packet->version != SS_PROTOCOL_VERSION) {
+        ESP_LOGW(TAG, "unknown packet from " MACSTR, MAC2STR(from->addr));
+        return;
+    }
+
+    if (packet->type == SS_PACKET_UUID_REQUEST) {
+        printf("UUID_REQUEST session=%" PRIu32 " node=" MACSTR " uuid=", packet->session_id,
+               MAC2STR(packet->node_mac));
+        printf("%.*s", packet->payload_len, (char *)packet->payload);
+        printf(" uuid_hex=");
+        print_hex(packet->payload, packet->payload_len);
+        printf("\n");
+        fflush(stdout);
+
+        pending_response_t pending = {
+            .session_id = packet->session_id,
+        };
+        memcpy(pending.node_mac, packet->node_mac, sizeof(pending.node_mac));
+        xQueueOverwrite(s_pending_queue, &pending);
+        return;
+    }
+
+    if (packet->type != SS_PACKET_NODE_REPORT) {
+        ESP_LOGW(TAG, "unsupported packet type %u from " MACSTR, packet->type, MAC2STR(from->addr));
+        return;
+    }
+
+    printf("NODE_REPORT session=%" PRIu32 " node=" MACSTR " ble=%02x:%02x:%02x:%02x:%02x:%02x rssi=%d distance_cm=%u payload_hex=",
+           packet->session_id, MAC2STR(packet->node_mac), packet->bt_addr[5], packet->bt_addr[4], packet->bt_addr[3],
+           packet->bt_addr[2], packet->bt_addr[1], packet->bt_addr[0], packet->rssi, packet->distance_cm);
+    print_hex(packet->payload, packet->payload_len);
+    printf("\n");
+    fflush(stdout);
+
+    pending_response_t pending = {
+        .session_id = packet->session_id,
+    };
+    memcpy(pending.node_mac, packet->node_mac, sizeof(pending.node_mac));
+    xQueueOverwrite(s_pending_queue, &pending);
+    send_response(packet->node_mac, packet->session_id, CONFIG_SS_ROOT_DEFAULT_RESPONSE);
+}
+
+static void mesh_rx_task(void *arg)
+{
+    mesh_rx_item_t received;
+
+    while (xQueueReceive(s_mesh_rx_queue, &received, portMAX_DELAY) == pdTRUE) {
+        process_mesh_packet(&received.packet, &received.from);
+    }
+}
+
 static void mesh_recv_cb(mesh_addr_t *from, mesh_data_t *data)
 {
     if (data->size < sizeof(ss_mesh_packet_t)) {
@@ -78,48 +138,12 @@ static void mesh_recv_cb(mesh_addr_t *from, mesh_data_t *data)
         return;
     }
 
-    ss_mesh_packet_t packet;
-    memcpy(&packet, data->data, sizeof(packet));
-    if (packet.magic != SS_PROTOCOL_MAGIC || packet.version != SS_PROTOCOL_VERSION) {
-        ESP_LOGW(TAG, "unknown packet from " MACSTR, MAC2STR(from->addr));
-        return;
+    mesh_rx_item_t received = { 0 };
+    received.from = *from;
+    memcpy(&received.packet, data->data, sizeof(received.packet));
+    if (xQueueSend(s_mesh_rx_queue, &received, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "mesh RX queue full, dropping packet from " MACSTR, MAC2STR(from->addr));
     }
-
-    if (packet.type == SS_PACKET_UUID_REQUEST) {
-        printf("UUID_REQUEST session=%" PRIu32 " node=" MACSTR " uuid=", packet.session_id,
-               MAC2STR(packet.node_mac));
-        printf("%.*s", packet.payload_len, (char *)packet.payload);
-        printf(" uuid_hex=");
-        print_hex(packet.payload, packet.payload_len);
-        printf("\n");
-        fflush(stdout);
-
-        pending_response_t pending = {
-            .session_id = packet.session_id,
-        };
-        memcpy(pending.node_mac, packet.node_mac, sizeof(pending.node_mac));
-        xQueueOverwrite(s_pending_queue, &pending);
-        return;
-    }
-
-    if (packet.type != SS_PACKET_NODE_REPORT) {
-        ESP_LOGW(TAG, "unsupported packet type %u from " MACSTR, packet.type, MAC2STR(from->addr));
-        return;
-    }
-
-    printf("NODE_REPORT session=%" PRIu32 " node=" MACSTR " ble=%02x:%02x:%02x:%02x:%02x:%02x rssi=%d distance_cm=%u payload_hex=",
-           packet.session_id, MAC2STR(packet.node_mac), packet.bt_addr[5], packet.bt_addr[4], packet.bt_addr[3],
-           packet.bt_addr[2], packet.bt_addr[1], packet.bt_addr[0], packet.rssi, packet.distance_cm);
-    print_hex(packet.payload, packet.payload_len);
-    printf("\n");
-    fflush(stdout);
-
-    pending_response_t pending = {
-        .session_id = packet.session_id,
-    };
-    memcpy(pending.node_mac, packet.node_mac, sizeof(pending.node_mac));
-    xQueueOverwrite(s_pending_queue, &pending);
-    send_response(packet.node_mac, packet.session_id, CONFIG_SS_ROOT_DEFAULT_RESPONSE);
 }
 
 static bool parse_mac(const char *text, uint8_t mac[6])
@@ -176,12 +200,29 @@ static void print_routes(void)
     }
 }
 
+static void print_tree(void)
+{
+    ss_mesh_tree_t tree;
+    esp_err_t err = ss_mesh_tree_build(&tree);
+    if (err != ESP_OK) {
+        printf("ERR tree %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("TREE count=%u complete=%d\n", tree.count, tree.complete);
+    for (uint16_t i = 0; i < tree.count; i++) {
+        ss_mesh_tree_node_t *node = &tree.nodes[i];
+        printf("%u " MACSTR " parent=" MACSTR " parent_known=%d direct_child=%d\n", i,
+               MAC2STR(node->mac), MAC2STR(node->parent_mac), node->parent_known, node->direct_child);
+    }
+}
+
 static void print_help(void)
 {
     printf("Commands:\n");
     printf("help - show commands\n");
     printf("ping - healthcheck root serial\n");
     printf("routes - print mesh routing table\n");
+    printf("tree - print the current mesh tree\n");
     printf("send <node_mac> <text> - send response to node\n");
     printf("reply <text> - send response to last reporting node\n");
     printf("color <#RRGGBB> - send color to last UUID/reporting node\n");
@@ -208,6 +249,8 @@ static void serial_task(void *arg)
             fflush(stdout);
         } else if (strcmp(line, "routes") == 0) {
             print_routes();
+        } else if (strcmp(line, "tree") == 0) {
+            print_tree();
         } else if (strncmp(line, "reply ", 6) == 0) {
             if (xQueuePeek(s_pending_queue, &pending, 0) != pdTRUE) {
                 printf("ERR no pending node\n");
@@ -273,7 +316,10 @@ static void serial_task(void *arg)
 void app_main(void)
 {
     s_pending_queue = xQueueCreate(1, sizeof(pending_response_t));
+    s_mesh_rx_queue = xQueueCreate(8, sizeof(mesh_rx_item_t));
     ESP_ERROR_CHECK(s_pending_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    ESP_ERROR_CHECK(s_mesh_rx_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(ss_mesh_init(mesh_recv_cb, true));
     xTaskCreate(serial_task, "serial", 4096, NULL, 5, NULL);
+    xTaskCreate(mesh_rx_task, "mesh_rx_proc", 4096, NULL, 5, NULL);
 }
