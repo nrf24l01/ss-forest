@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write a UUID string to an SS Forest node over BLE GATT."""
+"""Write a team UUID and attack-points count to an SS Forest node over BLE GATT."""
 
 import argparse
 import asyncio
@@ -30,9 +30,8 @@ async def find_device(args: argparse.Namespace):
 
 async def main_async(args: argparse.Namespace) -> None:
     node_uuid = args.uuid or str(uuid.uuid4())
-    payload = node_uuid.encode("ascii")
-    if len(payload) > 64:
-        raise ValueError("UUID payload must be <= 64 bytes")
+    team_uuid = uuid.UUID(node_uuid)
+    payload = team_uuid.bytes + args.attack_points.to_bytes(2, byteorder="little")
 
     address = await find_device(args)
     print(f"Connecting to {address}...")
@@ -40,12 +39,14 @@ async def main_async(args: argparse.Namespace) -> None:
         if not client.is_connected:
             raise RuntimeError("BLE connection failed")
         await client.write_gatt_char(args.char_uuid, payload, response=True)
-        print(f"Wrote UUID to node: {node_uuid}")
+        print(f"Wrote UUID and attack points to node: {team_uuid} points={args.attack_points}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--uuid", help="UUID string to send. Default: generated uuid4")
+    parser.add_argument("--uuid", help="Team UUID to send. Default: generated uuid4")
+    parser.add_argument("--attack-points", type=int, required=True, choices=range(0, 65536),
+                        metavar="0..65535", help="Unsigned 16-bit attack-points count")
     parser.add_argument("--address", help="BLE MAC/address. If omitted, scan by --name")
     parser.add_argument("--name", default=DEFAULT_DEVICE_NAME, help=f"BLE device name, default {DEFAULT_DEVICE_NAME}")
     parser.add_argument("--char-uuid", default=CHAR_UUID, help=f"Writable characteristic UUID, default {CHAR_UUID}")

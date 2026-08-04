@@ -4,7 +4,7 @@
 ---
 ESP-IDF project for a tree-shaped low-power wireless network.
 
-The root target is ESP32-H2 and the node target is ESP32-C3. The current firmware transport is ESP-MESH over Wi-Fi, so the root must remain on a Wi-Fi-capable target. ESP32-H2 has BLE and IEEE 802.15.4, but no Wi-Fi; migrating the root transport to Thread/OpenThread (or another 802.15.4 transport) is required before the root can run on H2.
+The root target is ESP32-WROOM-32 and the node target is ESP32-C3. The firmware transport is ESP-MESH over Wi-Fi, so the root must use a Wi-Fi-capable target.
 
 The repository has two firmware applications:
 
@@ -15,20 +15,18 @@ Shared mesh code is in `components/ss_mesh/`.
 
 ## Hardware
 
-- Target: ESP32-H2 for the root and ESP32-C3 for nodes.
-- Button: GPIO2, input pull-up. Connect button between GPIO2 and GND.
-- WS2812B DIN: GPIO7.
+- Target: ESP32-WROOM-32 for the root and ESP32-C3 for nodes.
+- Node button and WS2812B pins are configured with `CONFIG_SS_BUTTON_GPIO` and `CONFIG_SS_LED_GPIO`.
 - WS2812B power: use a suitable 5 V/3.3 V setup for your LED strip and common GND with ESP32-C3.
 
 ## How It Works
 
-1. Node works as ESP-MESH repeater/client and connects to the root.
-2. Button press starts BLE scan.
-3. The strongest BLE advertising device is treated as the nearest device.
-4. Distance is estimated from RSSI and accepted only when it is not above `CONFIG_SS_BLE_MAX_DISTANCE_CM`.
-5. Node sends `NODE_REPORT` to root through ESP-MESH.
-6. Root prints the report to serial and sends a response.
-7. Node receives the response and finishes the session.
+1. Node works as an ESP-MESH repeater/client and connects to the root.
+2. Button press opens its BLE GATT connectability window.
+3. A user writes an 18-byte value: raw 16-byte team UUID followed by little-endian `uint16_t` attack points.
+4. Node sends its MAC address, team UUID, attack points, and a session ID to root through ESP-MESH.
+5. Root prints the request and accepts one `color <node_mac> <#RRGGBB>` reply for it.
+6. Node accepts the matching session color and updates LED0.
 
 BLE distance from RSSI is approximate. Calibrate `CONFIG_SS_BLE_RSSI_AT_ONE_METER` for your beacon/device and environment before relying on the 1 m threshold.
 
@@ -51,26 +49,18 @@ WS2812B uses two LEDs when `CONFIG_SS_LED_COUNT >= 2`:
 
 ## Root Serial Output
 
-Root prints one line per completed BLE scan report:
+Root prints UUID requests received from a user through a node BLE GATT write:
 
 ```text
-NODE_REPORT session=123456 node=aa:bb:cc:dd:ee:ff ble=11:22:33:44:55:66 rssi=-52 distance_cm=78 payload_hex=020106...
-```
-
-Root also prints UUID requests received from a PC through a node BLE GATT write:
-
-```text
-UUID_REQUEST session=123456 node=aa:bb:cc:dd:ee:ff uuid=550e8400-e29b-41d4-a716-446655440000 uuid_hex=353530...
+UUID_REQUEST session=123456 node=aa:bb:cc:dd:ee:ff uuid=550e8400e29b41d4a716446655440000 attack_points=42 uuid_hex=550e8400e29b41d4a716446655440000
 ```
 
 Fields:
 
 - `session` - node-generated session id.
 - `node` - mesh STA MAC of the reporting node.
-- `ble` - nearest BLE advertiser address.
-- `rssi` - received signal strength.
-- `distance_cm` - RSSI-based estimated distance.
-- `payload_hex` - raw BLE advertising payload.
+- `uuid` - raw 16-byte team UUID in hexadecimal.
+- `attack_points` - unsigned 16-bit count supplied by the user.
 
 ## Root Serial Commands
 
@@ -79,31 +69,27 @@ Use `idf.py monitor` or any serial terminal. Commands end with Enter.
 ```text
 help
 routes
+nodes
 tree
-reply <text>
-color <#RRGGBB>
-sendcolor <node_mac> <#RRGGBB>
-send <node_mac> <text>
+getcolor <node_mac>
+color <node_mac> <#RRGGBB>
 ```
 
 Commands:
 
 - `help` - print available commands.
 - `routes` - print current ESP-MESH routing table.
+- `nodes` - print all currently connected node MAC addresses.
 - `tree` - print a snapshot of the mesh tree. Direct-child relationships are marked as known; routed descendants use the root as a safe fallback parent.
-- `reply <text>` - send a response to the last node that produced `NODE_REPORT`.
-- `color <#RRGGBB>` - send RGB color to the last node that produced `UUID_REQUEST` or `NODE_REPORT`.
-- `send <node_mac> <text>` - send a response to a specific node MAC. This uses session id `0`, which nodes accept as an out-of-band response.
-- `sendcolor <node_mac> <#RRGGBB>` - send RGB color to a specific node MAC. This uses session id `0` and immediately sets WS2812B on the node.
-
-The root also sends `CONFIG_SS_ROOT_DEFAULT_RESPONSE` automatically for every `NODE_REPORT`.
+- `getcolor <node_mac>` - request the current displayed LED0 color from any connected node.
+- `color <node_mac> <#RRGGBB>` - send RGB color only for that node's outstanding UUID/attack-points request.
 
 ## Configuration
 
 Run menuconfig separately for root and node:
 
 ```bash
-idf.py -C root set-target esp32h2
+idf.py -C root set-target esp32
 idf.py -C root menuconfig
 idf.py -C node set-target esp32c3
 idf.py -C node menuconfig
@@ -154,7 +140,7 @@ already-built images. Set `IDF_PY` or pass `--idf` when `idf.py` is not on
 Root:
 
 ```bash
-idf.py -C root set-target esp32h2
+idf.py -C root set-target esp32
 idf.py -C root build
 idf.py -C root -p /dev/ttyUSB0 flash monitor
 ```
@@ -231,7 +217,7 @@ The Go server owns the serial port, responds to UUID requests, continuously buff
 Send a UUID from PC to a node over BLE GATT:
 
 ```bash
-uv run ss-ble-uuid-test --uuid 550e8400-e29b-41d4-a716-446655440000
+uv run ss-ble-uuid-test --uuid 550e8400-e29b-41d4-a716-446655440000 --attack-points 42
 ```
 
 Expected flow:
@@ -239,7 +225,7 @@ Expected flow:
 1. `ble_uuid_test.py` writes UUID to BLE device `SS-FOREST-NODE`.
 2. Node sends `SS_PACKET_UUID_REQUEST` through ESP-MESH to root.
 3. Root prints `UUID_REQUEST ...` over USB serial.
-4. `root_color_test.py` detects the line, looks up `uuid:color`, and sends `color <RRGGBB>` to root.
+4. `root_color_test.py` detects the line, looks up `uuid:color`, and sends `color <node_mac> <RRGGBB>` to root.
 5. Root sends `SS_PACKET_COLOR_RESPONSE` through ESP-MESH to the node.
 6. Node sets WS2812B to the received RGB color.
 
@@ -247,7 +233,6 @@ The BLE service UUID is `01008f7a-8e13-6e9b-8348-6df4029a6c70` and the writable 
 
 ## Notes
 
-- The root is currently configured for ESP32-H2, while nodes remain ESP32-C3 because ESP-MESH requires Wi-Fi.
+- The root is configured for ESP32-WROOM-32 and nodes for ESP32-C3 because ESP-MESH requires Wi-Fi.
 - The root firmware fixes itself as ESP-MESH root using `esp_mesh_fix_root(true)` and `esp_mesh_set_type(MESH_ROOT)`.
 - Child nodes are not fixed root and can form the tree below root.
-- BLE scanning and Wi-Fi mesh share the 2.4 GHz radio. Very long BLE scans can reduce mesh responsiveness.

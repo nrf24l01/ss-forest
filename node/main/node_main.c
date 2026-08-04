@@ -1,4 +1,3 @@
-#include <math.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -52,30 +51,22 @@ typedef enum {
 } ble_window_event_t;
 
 typedef struct {
-    ble_addr_t addr;
-    int8_t rssi;
-    uint8_t payload_len;
-    uint8_t payload[SS_PROTOCOL_MAX_PAYLOAD];
-    bool found;
-} ble_target_t;
-
-typedef struct {
-    uint8_t len;
-    uint8_t value[SS_PROTOCOL_MAX_PAYLOAD];
+    uint8_t uuid[SS_TEAM_UUID_SIZE];
+    uint16_t attack_points;
 } uuid_request_t;
 
 typedef struct {
     QueueHandle_t button_queue;
     QueueHandle_t uuid_queue;
     QueueHandle_t response_queue;
+    QueueHandle_t color_query_queue;
     QueueHandle_t ble_window_queue;
-    SemaphoreHandle_t scan_lock;
+    SemaphoreHandle_t state_lock;
     led_strip_handle_t led_strip;
     led_state_t led_state;
     bool mesh_connected_once;
     bool mesh_connected;
     uint8_t color_rgb[3];
-    ble_target_t best_target;
     uint32_t current_session_id;
 } node_ctx_t;
 
@@ -102,21 +93,6 @@ static void close_ble_window(void)
     xQueueSend(s_ctx.ble_window_queue, &event, 0);
 }
 
-static uint16_t estimate_distance_cm(int8_t rssi)
-{
-    float ratio = ((float)CONFIG_SS_BLE_RSSI_AT_ONE_METER - (float)rssi) /
-                  ((float)CONFIG_SS_BLE_PATH_LOSS_EXPONENT_X10 / 10.0f * 10.0f);
-    float meters = powf(10.0f, ratio);
-
-    if (meters < 0.01f) {
-        meters = 0.01f;
-    }
-    if (meters > 10.0f) {
-        meters = 10.0f;
-    }
-    return (uint16_t)(meters * 100.0f);
-}
-
 static void led_set_pixels(uint8_t color_red, uint8_t color_green, uint8_t color_blue,
                            uint8_t status_red, uint8_t status_green, uint8_t status_blue)
 {
@@ -134,22 +110,16 @@ static void led_set_pixels(uint8_t color_red, uint8_t color_green, uint8_t color
 
 static void led_set_color_from_payload(const uint8_t *payload, uint8_t payload_len)
 {
-    if (payload_len == 0) {
-        s_ctx.color_rgb[0] = 0;
-        s_ctx.color_rgb[1] = 0;
-        s_ctx.color_rgb[2] = 0;
-        s_ctx.led_state = LED_KEEP_COLOR;
-        close_ble_window();
-        return;
-    }
     if (payload_len != 3) {
         ESP_LOGW(TAG, "invalid color payload length: %u", payload_len);
         return;
     }
+    xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
     s_ctx.color_rgb[0] = payload[0];
     s_ctx.color_rgb[1] = payload[1];
     s_ctx.color_rgb[2] = payload[2];
     s_ctx.led_state = LED_KEEP_COLOR;
+    xSemaphoreGive(s_ctx.state_lock);
     close_ble_window();
 }
 
@@ -163,17 +133,20 @@ static void led_task(void *arg)
     uint8_t last_status[3] = { 0xff, 0xff, 0xff };
 
     while (true) {
+        xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
         led_state_t mesh_state = s_ctx.mesh_connected ? LED_GREEN_SOLID :
-                                  (s_ctx.mesh_connected_once ? LED_RED_SOLID : LED_MESH_INIT);
+                                   (s_ctx.mesh_connected_once ? LED_RED_SOLID : LED_MESH_INIT);
         led_state_t led_state = s_ctx.led_state;
-        bool ble_activity = s_ble_window_active ||
-                            (led_state != LED_OFF && led_state != LED_KEEP_COLOR &&
-                             led_state != LED_MESH_INIT);
+        // Once a user connects, show the team color instead of the advertising blink.
+        bool ble_activity = (s_ble_window_active && s_ble_conn_handle == BLE_HS_CONN_HANDLE_NONE) ||
+                             (led_state != LED_OFF && led_state != LED_KEEP_COLOR &&
+                              led_state != LED_MESH_INIT);
         bool use_ble_color = ble_activity;
 
         uint8_t color_red = s_ctx.color_rgb[0];
         uint8_t color_green = s_ctx.color_rgb[1];
         uint8_t color_blue = s_ctx.color_rgb[2];
+        xSemaphoreGive(s_ctx.state_lock);
         uint8_t status_red = 0;
         uint8_t status_green = 0;
         uint8_t status_blue = 0;
@@ -334,20 +307,7 @@ static void button_task(void *arg)
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg)
 {
-    if (event->type == BLE_GAP_EVENT_DISC) {
-        const struct ble_gap_disc_desc *disc = &event->disc;
-        xSemaphoreTake(s_ctx.scan_lock, portMAX_DELAY);
-        if (!s_ctx.best_target.found || disc->rssi > s_ctx.best_target.rssi) {
-            s_ctx.best_target.addr = disc->addr;
-            s_ctx.best_target.rssi = disc->rssi;
-            s_ctx.best_target.payload_len = disc->length_data > SS_PROTOCOL_MAX_PAYLOAD ?
-                                            SS_PROTOCOL_MAX_PAYLOAD : disc->length_data;
-            memcpy(s_ctx.best_target.payload, disc->data, s_ctx.best_target.payload_len);
-            s_ctx.best_target.found = true;
-        }
-        xSemaphoreGive(s_ctx.scan_lock);
-        return 0;
-    } else if (event->type == BLE_GAP_EVENT_CONNECT) {
+    if (event->type == BLE_GAP_EVENT_CONNECT) {
         if (event->connect.status == 0) {
             s_ble_conn_handle = event->connect.conn_handle;
         } else if (s_ble_window_active) {
@@ -378,23 +338,25 @@ static int gatt_uuid_access_cb(uint16_t conn_handle, uint16_t attr_handle, struc
     }
 
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-    if (len == 0 || len > SS_PROTOCOL_MAX_PAYLOAD) {
+    if (len != SS_BLE_REQUEST_SIZE) {
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
-    uuid_request_t request = {
-        .len = len,
-    };
-    int rc = ble_hs_mbuf_to_flat(ctxt->om, request.value, sizeof(request.value), NULL);
+    uint8_t value[SS_BLE_REQUEST_SIZE];
+    int rc = ble_hs_mbuf_to_flat(ctxt->om, value, sizeof(value), NULL);
     if (rc != 0) {
         return BLE_ATT_ERR_UNLIKELY;
     }
+    uuid_request_t request = { 0 };
+    memcpy(request.uuid, value, sizeof(request.uuid));
+    request.attack_points = (uint16_t)value[SS_TEAM_UUID_SIZE] |
+                            ((uint16_t)value[SS_TEAM_UUID_SIZE + 1] << 8);
 
     if (xQueueSend(s_ctx.uuid_queue, &request, 0) != pdTRUE) {
         return BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
-    ESP_LOGI(TAG, "received UUID over BLE GATT, len=%u", request.len);
+    ESP_LOGI(TAG, "received team UUID and %u attack points over BLE GATT", request.attack_points);
     return 0;
 }
 
@@ -511,77 +473,87 @@ static void ble_window_task(void *arg)
     }
 }
 
-static esp_err_t scan_nearest_device(ble_target_t *target)
-{
-    struct ble_gap_disc_params params = {
-        .filter_duplicates = 1,
-        .passive = 0,
-        .itvl = 0x0010,
-        .window = 0x0010,
-    };
-
-    xSemaphoreTake(s_ctx.scan_lock, portMAX_DELAY);
-    memset(&s_ctx.best_target, 0, sizeof(s_ctx.best_target));
-    xSemaphoreGive(s_ctx.scan_lock);
-
-    int rc = ble_gap_disc(s_own_addr_type, CONFIG_SS_BLE_SCAN_SECONDS * 1000, &params, ble_gap_event, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
-        return ESP_FAIL;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(CONFIG_SS_BLE_SCAN_SECONDS * 1000 + 100));
-    ble_gap_disc_cancel();
-
-    xSemaphoreTake(s_ctx.scan_lock, portMAX_DELAY);
-    *target = s_ctx.best_target;
-    xSemaphoreGive(s_ctx.scan_lock);
-
-    return target->found ? ESP_OK : ESP_ERR_NOT_FOUND;
-}
-
 static void mesh_recv_cb(mesh_addr_t *from, mesh_data_t *data)
 {
-    if (data->size < sizeof(ss_mesh_packet_t)) {
-        ESP_LOGW(TAG, "short mesh packet from " MACSTR, MAC2STR(from->addr));
+    if (data->size != sizeof(ss_mesh_packet_t) || data->data == NULL) {
+        ESP_LOGW(TAG, "invalid mesh packet size from " MACSTR, MAC2STR(from->addr));
         return;
     }
 
     ss_mesh_packet_t packet;
     memcpy(&packet, data->data, sizeof(packet));
+    if (packet.payload_len > SS_PROTOCOL_MAX_PAYLOAD) {
+        ESP_LOGW(TAG, "invalid mesh payload length from " MACSTR, MAC2STR(from->addr));
+        return;
+    }
     if (packet.magic != SS_PROTOCOL_MAGIC || packet.version != SS_PROTOCOL_VERSION ||
-        memcmp(packet.node_mac, ss_mesh_get_station_mac(), sizeof(packet.node_mac)) != 0 ||
-        (packet.type != SS_PACKET_ROOT_RESPONSE && packet.type != SS_PACKET_COLOR_RESPONSE)) {
+        memcmp(packet.node_mac, ss_mesh_get_station_mac(), sizeof(packet.node_mac)) != 0) {
         return;
     }
 
-    // Color commands are addressed by node MAC. Do not correlate them with the
-    // shared transaction ID because button and UUID sessions may overlap.
+    if (packet.type == SS_PACKET_COLOR_QUERY) {
+        if (packet.payload_len != 0) {
+            return;
+        }
+        if (xQueueSend(s_ctx.color_query_queue, &packet, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "color query queue full");
+        }
+        return;
+    }
+
     if (packet.type == SS_PACKET_COLOR_RESPONSE) {
-        if (packet.payload_len != 0 && packet.payload_len != 3) {
+        if (packet.payload_len != 3) {
             ESP_LOGW(TAG, "invalid color response length: %u", packet.payload_len);
             return;
         }
-        ESP_LOGI(TAG, "color response accepted for " MACSTR " color=%02x%02x%02x",
-                 MAC2STR(packet.node_mac), packet.payload[0], packet.payload[1], packet.payload[2]);
-        led_set_color_from_payload(packet.payload, packet.payload_len);
+        xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
+        bool matches = packet.session_id == s_ctx.current_session_id && packet.session_id != 0;
+        xSemaphoreGive(s_ctx.state_lock);
+        if (!matches) {
+            ESP_LOGW(TAG, "ignored unmatched color response");
+            return;
+        }
+        if (xQueueSend(s_ctx.response_queue, &packet, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "color response queue full");
+        }
         return;
     }
+}
 
-    if (packet.session_id != s_ctx.current_session_id && packet.session_id != 0) {
-        return;
+static void color_query_task(void *arg)
+{
+    ss_mesh_packet_t query;
+
+    while (xQueueReceive(s_ctx.color_query_queue, &query, portMAX_DELAY) == pdTRUE) {
+        uint8_t color[3];
+        xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
+        memcpy(color, s_ctx.color_rgb, sizeof(color));
+        xSemaphoreGive(s_ctx.state_lock);
+
+        ss_mesh_packet_t status = {
+            .magic = SS_PROTOCOL_MAGIC,
+            .version = SS_PROTOCOL_VERSION,
+            .type = SS_PACKET_COLOR_STATUS,
+            .payload_len = sizeof(color),
+            .payload = { color[0], color[1], color[2] },
+        };
+        memcpy(status.node_mac, ss_mesh_get_station_mac(), sizeof(status.node_mac));
+        esp_err_t err = ss_mesh_send_to_root(&status, sizeof(status));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "send color status failed: %s", esp_err_to_name(err));
+        }
     }
-
-    xQueueSend(s_ctx.response_queue, &packet, 0);
 }
 
 static void mesh_status_task(void *arg)
 {
     while (true) {
+        xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
         s_ctx.mesh_connected = ss_mesh_is_connected();
         if (s_ctx.mesh_connected) {
             s_ctx.mesh_connected_once = true;
         }
+        xSemaphoreGive(s_ctx.state_lock);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
@@ -594,43 +566,64 @@ static void uuid_session_task(void *arg)
         xQueueReceive(s_ctx.uuid_queue, &request, portMAX_DELAY);
         if (!ss_mesh_is_connected()) {
             ESP_LOGW(TAG, "UUID received but mesh is not connected yet");
+            xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
             s_ctx.led_state = LED_RED_SOLID;
+            xSemaphoreGive(s_ctx.state_lock);
             vTaskDelay(pdMS_TO_TICKS(1200));
+            xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
             s_ctx.led_state = LED_OFF;
+            xSemaphoreGive(s_ctx.state_lock);
             continue;
         }
+        xQueueReset(s_ctx.response_queue);
+        xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
         s_ctx.current_session_id = esp_random();
+        if (s_ctx.current_session_id == 0) {
+            s_ctx.current_session_id = 1;
+        }
+        uint32_t session_id = s_ctx.current_session_id;
         s_ctx.led_state = LED_GREEN_FAST;
+        xSemaphoreGive(s_ctx.state_lock);
 
         ss_mesh_packet_t packet = {
             .magic = SS_PROTOCOL_MAGIC,
             .version = SS_PROTOCOL_VERSION,
             .type = SS_PACKET_UUID_REQUEST,
-            .session_id = s_ctx.current_session_id,
-            .payload_len = request.len,
+            .session_id = session_id,
+            .attack_points = request.attack_points,
+            .payload_len = SS_TEAM_UUID_SIZE,
         };
         memcpy(packet.node_mac, ss_mesh_get_station_mac(), sizeof(packet.node_mac));
-        memcpy(packet.payload, request.value, request.len);
+        memcpy(packet.payload, request.uuid, SS_TEAM_UUID_SIZE);
 
         esp_err_t err = ss_mesh_send_to_root(&packet, sizeof(packet));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "send UUID to root failed: %s", esp_err_to_name(err));
+            xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
             s_ctx.led_state = LED_RED_SOLID;
+            xSemaphoreGive(s_ctx.state_lock);
             vTaskDelay(pdMS_TO_TICKS(1200));
+            xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
             s_ctx.led_state = LED_OFF;
+            xSemaphoreGive(s_ctx.state_lock);
             continue;
         }
 
         ss_mesh_packet_t response;
         if (xQueueReceive(s_ctx.response_queue, &response, pdMS_TO_TICKS(CONFIG_SS_ROOT_RESPONSE_TIMEOUT_MS))) {
-            if (response.type == SS_PACKET_COLOR_RESPONSE) {
+            if (response.type == SS_PACKET_COLOR_RESPONSE && response.session_id == session_id &&
+                response.payload_len == 3) {
                 led_set_color_from_payload(response.payload, response.payload_len);
             }
         } else {
             ESP_LOGW(TAG, "color response timeout");
+            xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
             s_ctx.led_state = LED_RED_SOLID;
+            xSemaphoreGive(s_ctx.state_lock);
             vTaskDelay(pdMS_TO_TICKS(1200));
+            xSemaphoreTake(s_ctx.state_lock, portMAX_DELAY);
             s_ctx.led_state = LED_OFF;
+            xSemaphoreGive(s_ctx.state_lock);
         }
     }
 }
@@ -642,78 +635,6 @@ static void session_task(void *arg)
     while (true) {
         xQueueReceive(s_ctx.button_queue, &event, portMAX_DELAY);
         xQueueSend(s_ctx.ble_window_queue, &event, 0);
-        if (!ss_mesh_is_connected()) {
-            ESP_LOGW(TAG, "button pressed but mesh is not connected yet");
-            s_ctx.led_state = LED_RED_SOLID;
-            vTaskDelay(pdMS_TO_TICKS(500));
-            s_ctx.led_state = LED_OFF;
-            continue;
-        }
-        s_ctx.current_session_id = esp_random();
-        s_ctx.led_state = LED_BLUE_FAST;
-
-        ble_target_t target;
-        esp_err_t err = scan_nearest_device(&target);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "BLE device not found");
-            s_ctx.led_state = LED_BLUE_SLOW;
-            vTaskDelay(pdMS_TO_TICKS(1200));
-            s_ctx.led_state = LED_OFF;
-            continue;
-        }
-
-        uint16_t distance_cm = estimate_distance_cm(target.rssi);
-        if (distance_cm > CONFIG_SS_BLE_MAX_DISTANCE_CM) {
-            ESP_LOGW(TAG, "nearest BLE device too far: addr=%02x:%02x:%02x:%02x:%02x:%02x rssi=%d distance=%u cm",
-                     target.addr.val[5], target.addr.val[4], target.addr.val[3], target.addr.val[2],
-                     target.addr.val[1], target.addr.val[0], target.rssi, distance_cm);
-            s_ctx.led_state = LED_BLUE_SLOW;
-            vTaskDelay(pdMS_TO_TICKS(1200));
-            s_ctx.led_state = LED_OFF;
-            continue;
-        }
-
-        s_ctx.led_state = LED_YELLOW_SOLID;
-        ss_mesh_packet_t packet = {
-            .magic = SS_PROTOCOL_MAGIC,
-            .version = SS_PROTOCOL_VERSION,
-            .type = SS_PACKET_NODE_REPORT,
-            .session_id = s_ctx.current_session_id,
-            .rssi = target.rssi,
-            .distance_cm = distance_cm,
-            .payload_len = target.payload_len,
-        };
-        memcpy(packet.node_mac, ss_mesh_get_station_mac(), sizeof(packet.node_mac));
-        memcpy(packet.bt_addr, target.addr.val, sizeof(packet.bt_addr));
-        memcpy(packet.payload, target.payload, target.payload_len);
-
-        s_ctx.led_state = LED_GREEN_FAST;
-        err = ss_mesh_send_to_root(&packet, sizeof(packet));
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "send report to root failed: %s", esp_err_to_name(err));
-            s_ctx.led_state = LED_RED_SOLID;
-            vTaskDelay(pdMS_TO_TICKS(1200));
-            s_ctx.led_state = LED_OFF;
-            continue;
-        }
-
-        ss_mesh_packet_t response;
-        if (xQueueReceive(s_ctx.response_queue, &response, pdMS_TO_TICKS(CONFIG_SS_ROOT_RESPONSE_TIMEOUT_MS))) {
-            ESP_LOGI(TAG, "root response: %.*s", response.payload_len, response.payload);
-            if (response.type == SS_PACKET_COLOR_RESPONSE) {
-                led_set_color_from_payload(response.payload, response.payload_len);
-            } else {
-                s_ctx.led_state = LED_GREEN_SOLID;
-            }
-        } else {
-            ESP_LOGW(TAG, "root response timeout");
-            s_ctx.led_state = LED_RED_SOLID;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        if (s_ctx.led_state != LED_KEEP_COLOR) {
-            s_ctx.led_state = LED_OFF;
-        }
     }
 }
 
@@ -723,13 +644,15 @@ void app_main(void)
     s_ctx.button_queue = xQueueCreate(4, sizeof(uint8_t));
     s_ctx.uuid_queue = xQueueCreate(4, sizeof(uuid_request_t));
     s_ctx.response_queue = xQueueCreate(2, sizeof(ss_mesh_packet_t));
+    s_ctx.color_query_queue = xQueueCreate(4, sizeof(ss_mesh_packet_t));
     s_ctx.ble_window_queue = xQueueCreate(2, sizeof(uint8_t));
-    s_ctx.scan_lock = xSemaphoreCreateMutex();
+    s_ctx.state_lock = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(s_ctx.button_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(s_ctx.uuid_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(s_ctx.response_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    ESP_ERROR_CHECK(s_ctx.color_query_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(s_ctx.ble_window_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
-    ESP_ERROR_CHECK(s_ctx.scan_lock == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    ESP_ERROR_CHECK(s_ctx.state_lock == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     ESP_ERROR_CHECK(led_init());
     s_ctx.mesh_connected = false;
@@ -749,6 +672,7 @@ void app_main(void)
     s_ctx.led_state = LED_OFF;
 
     xTaskCreate(mesh_status_task, "mesh_status", 2048, NULL, 4, NULL);
+    xTaskCreate(color_query_task, "color_query", 3072, NULL, 5, NULL);
 
     xTaskCreate(session_task, "session", 4096, NULL, 5, NULL);
     xTaskCreate(uuid_session_task, "uuid_session", 4096, NULL, 5, NULL);

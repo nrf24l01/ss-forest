@@ -6,11 +6,15 @@ import json
 import re
 import sys
 import time
+import uuid
 
 import serial
 
 
-UUID_RE = re.compile(r"UUID_REQUEST\s+session=(?P<session>\d+)\s+node=(?P<node>[0-9a-fA-F:]{17})\s+uuid=(?P<uuid>\S*)")
+UUID_RE = re.compile(
+    r"UUID_REQUEST\s+session=(?P<session>\d+)\s+node=(?P<node>[0-9a-fA-F:]{17})\s+"
+    r"uuid=(?P<uuid>[0-9a-fA-F]{32})\s+attack_points=(?P<attack_points>\d+)"
+)
 
 
 def normalize_color(color: str) -> str:
@@ -21,6 +25,13 @@ def normalize_color(color: str) -> str:
     return color.lower()
 
 
+def normalize_uuid(uuid_text: str) -> str:
+    try:
+        return str(uuid.UUID(uuid_text))
+    except ValueError:
+        return uuid_text.strip().lower()
+
+
 def parse_uuid_color_pair(pair: str) -> tuple[str, str]:
     if ":" not in pair:
         raise ValueError(f"invalid UUID color pair {pair!r}; expected uuid:color")
@@ -28,7 +39,7 @@ def parse_uuid_color_pair(pair: str) -> tuple[str, str]:
     uuid_text = uuid_text.strip()
     if not uuid_text:
         raise ValueError("uuid in uuid:color pair cannot be empty")
-    return uuid_text, normalize_color(color.strip())
+    return normalize_uuid(uuid_text), normalize_color(color.strip())
 
 
 def load_uuid_color_table(args: argparse.Namespace) -> dict[str, str]:
@@ -40,7 +51,7 @@ def load_uuid_color_table(args: argparse.Namespace) -> dict[str, str]:
         if not isinstance(raw_table, dict):
             raise ValueError("table file must contain a JSON object: {\"uuid\": \"RRGGBB\"}")
         for uuid_text, color in raw_table.items():
-            table[str(uuid_text)] = normalize_color(str(color))
+            table[normalize_uuid(str(uuid_text))] = normalize_color(str(color))
 
     for pair in args.map:
         uuid_text, color = parse_uuid_color_pair(pair)
@@ -97,10 +108,13 @@ def run(args: argparse.Namespace) -> None:
             if not match:
                 continue
 
-            uuid_text = match.group("uuid")
+            uuid_text = normalize_uuid(match.group("uuid"))
             color = uuid_color_table.get(uuid_text, default_color)
-            command = f"color {color}\n"
-            print(f"UUID_REQUEST node={match.group('node')} uuid={uuid_text} -> #{color}")
+            command = f"color {match.group('node')} {color}\n"
+            print(
+                f"REQUEST attack_points={match.group('attack_points')} returned_color=#{color} "
+                f"node_mac={match.group('node')} input_uuid={uuid_text}"
+            )
             ser.write(command.encode("ascii"))
             ser.flush()
 

@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import threading
+import uuid
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,6 +47,7 @@ class MeshState:
 
     def set_color(self, uuid_text: str, color: str) -> str:
         normalized = root_color_test.normalize_color(color)
+        uuid_text = root_color_test.normalize_uuid(uuid_text)
         with self.colors_lock:
             self.colors[uuid_text] = normalized
             self.save_colors()
@@ -64,11 +66,11 @@ class MeshState:
     def handle_line(self, line: str) -> None:
         uuid_match = UUID_RE.search(line)
         if uuid_match:
-            uuid_text = uuid_match.group("uuid")
+            uuid_text = str(uuid.UUID(hex=uuid_match.group("uuid")))
             with self.colors_lock:
                 color = self.colors.get(uuid_text, self.args.color)
             print(f"UUID_REQUEST node={uuid_match.group('node')} uuid={uuid_text} -> #{color}", flush=True)
-            self.write_serial(f"color {color}")
+            self.write_serial(f"color {uuid_match.group('node')} {color}")
 
         tree_match = TREE_HEADER_RE.fullmatch(line)
         if tree_match:
