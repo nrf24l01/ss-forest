@@ -13,7 +13,8 @@ import serial
 
 UUID_RE = re.compile(
     r"UUID_REQUEST\s+session=(?P<session>\d+)\s+node=(?P<node>[0-9a-fA-F:]{17})\s+"
-    r"uuid=(?P<uuid>[0-9a-fA-F]{32})\s+attack_points=(?P<attack_points>\d+)"
+    r"uuid=(?P<uuid>[0-9a-fA-F]{32})\s+attack_points=(?P<attack_points>\d+)\s+"
+    r"rssi=(?P<rssi>-?\d+)\s+distance_cm=(?P<distance_cm>\d+)"
 )
 
 
@@ -112,7 +113,8 @@ def run(args: argparse.Namespace) -> None:
             color = uuid_color_table.get(uuid_text, default_color)
             command = f"color {match.group('node')} {color}\n"
             print(
-                f"REQUEST attack_points={match.group('attack_points')} returned_color=#{color} "
+                f"REQUEST attack_points={match.group('attack_points')} rssi={match.group('rssi')} "
+                f"distance_cm={match.group('distance_cm')} returned_color=#{color} "
                 f"node_mac={match.group('node')} input_uuid={uuid_text}"
             )
             ser.write(command.encode("ascii"))

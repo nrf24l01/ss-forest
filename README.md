@@ -24,9 +24,10 @@ Shared mesh code is in `components/ss_mesh/`.
 1. Node works as an ESP-MESH repeater/client and connects to the root.
 2. Button press opens its BLE GATT connectability window.
 3. A user writes an 18-byte value: raw 16-byte team UUID followed by little-endian `uint16_t` attack points.
-4. Node sends its MAC address, team UUID, attack points, and a session ID to root through ESP-MESH.
-5. Root prints the request and accepts one `color <node_mac> <#RRGGBB>` reply for it.
-6. Node accepts the matching session color and updates LED0.
+4. Node accepts the GATT write only when the client's RSSI-estimated distance is within `CONFIG_SS_BLE_MAX_DISTANCE_CM` (100 cm by default).
+5. Node sends its MAC address, team UUID, attack points, RSSI, estimated distance, and a session ID to root through ESP-MESH.
+6. Root prints the request and accepts one `color <node_mac> <#RRGGBB>` reply for it.
+7. Node accepts the matching session color and updates LED0.
 
 BLE distance from RSSI is approximate. Calibrate `CONFIG_SS_BLE_RSSI_AT_ONE_METER` for your beacon/device and environment before relying on the 1 m threshold.
 
@@ -61,6 +62,7 @@ Fields:
 - `node` - mesh STA MAC of the reporting node.
 - `uuid` - raw 16-byte team UUID in hexadecimal.
 - `attack_points` - unsigned 16-bit count supplied by the user.
+- `rssi` and `distance_cm` - BLE client signal strength and RSSI-based distance estimate used for the acceptance gate.
 
 ## Root Serial Commands
 

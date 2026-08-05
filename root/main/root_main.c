@@ -153,7 +153,8 @@ static void process_mesh_packet(const ss_mesh_packet_t *packet, const mesh_addr_
         printf("UUID_REQUEST session=%" PRIu32 " node=" MACSTR " uuid=", packet->session_id,
                MAC2STR(packet->node_mac));
         print_hex(packet->payload, packet->payload_len);
-        printf(" attack_points=%u uuid_hex=", packet->attack_points);
+        printf(" attack_points=%u rssi=%d distance_cm=%u uuid_hex=", packet->attack_points, packet->rssi,
+               packet->distance_cm);
         print_hex(packet->payload, packet->payload_len);
         printf("\n");
         fflush(stdout);

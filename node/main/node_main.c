@@ -1,3 +1,4 @@
+#include <math.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -91,6 +92,34 @@ static void close_ble_window(void)
 {
     uint8_t event = BLE_WINDOW_CLOSE;
     xQueueSend(s_ctx.ble_window_queue, &event, 0);
+}
+
+static uint16_t estimate_distance_cm(int8_t rssi)
+{
+    float ratio = ((float)CONFIG_SS_BLE_RSSI_AT_ONE_METER - (float)rssi) /
+                  ((float)CONFIG_SS_BLE_PATH_LOSS_EXPONENT_X10 / 10.0f * 10.0f);
+    float meters = powf(10.0f, ratio);
+
+    if (meters < 0.01f) {
+        meters = 0.01f;
+    }
+    if (meters > 10.0f) {
+        meters = 10.0f;
+    }
+    return (uint16_t)(meters * 100.0f);
+}
+
+static bool ble_client_is_within_range(uint16_t conn_handle, int8_t *rssi, uint16_t *distance_cm)
+{
+    *rssi = 0;
+    *distance_cm = 0;
+    if (ble_gap_conn_rssi(conn_handle, rssi) != 0) {
+        ESP_LOGW(TAG, "cannot read BLE client RSSI");
+        return false;
+    }
+
+    *distance_cm = estimate_distance_cm(*rssi);
+    return *distance_cm <= CONFIG_SS_BLE_MAX_DISTANCE_CM;
 }
 
 static void led_set_pixels(uint8_t color_red, uint8_t color_green, uint8_t color_blue,
@@ -309,7 +338,16 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 {
     if (event->type == BLE_GAP_EVENT_CONNECT) {
         if (event->connect.status == 0) {
+            int8_t rssi;
+            uint16_t distance_cm;
+            if (!ble_client_is_within_range(event->connect.conn_handle, &rssi, &distance_cm)) {
+                ESP_LOGW(TAG, "rejected BLE client: rssi=%d distance=%u cm limit=%u cm", rssi, distance_cm,
+                         CONFIG_SS_BLE_MAX_DISTANCE_CM);
+                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                return 0;
+            }
             s_ble_conn_handle = event->connect.conn_handle;
+            ESP_LOGI(TAG, "accepted BLE client: rssi=%d distance=%u cm", rssi, distance_cm);
         } else if (s_ble_window_active) {
             start_ble_advertising();
         }
@@ -337,6 +375,15 @@ static int gatt_uuid_access_cb(uint16_t conn_handle, uint16_t attr_handle, struc
         return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
     }
 
+    int8_t rssi;
+    uint16_t distance_cm;
+    if (!ble_client_is_within_range(conn_handle, &rssi, &distance_cm)) {
+        ESP_LOGW(TAG, "rejected BLE GATT write: rssi=%d distance=%u cm limit=%u cm", rssi, distance_cm,
+                 CONFIG_SS_BLE_MAX_DISTANCE_CM);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+    }
+
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
     if (len != SS_BLE_REQUEST_SIZE) {
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
@@ -356,7 +403,8 @@ static int gatt_uuid_access_cb(uint16_t conn_handle, uint16_t attr_handle, struc
         return BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
-    ESP_LOGI(TAG, "received team UUID and %u attack points over BLE GATT", request.attack_points);
+    ESP_LOGI(TAG, "received team UUID and %u attack points over BLE GATT, rssi=%d distance=%u cm",
+             request.attack_points, rssi, distance_cm);
     return 0;
 }
 
@@ -590,6 +638,8 @@ static void uuid_session_task(void *arg)
             .version = SS_PROTOCOL_VERSION,
             .type = SS_PACKET_UUID_REQUEST,
             .session_id = session_id,
+            .rssi = rssi,
+            .distance_cm = distance_cm,
             .attack_points = request.attack_points,
             .payload_len = SS_TEAM_UUID_SIZE,
         };
